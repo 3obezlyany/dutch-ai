@@ -9,3 +9,6 @@ Russian GPT model for Discord, which copy your style and generate random message
 
 # Warning:
 It is ruGPT, and it works at Russian language, and most of messages must be at russian
+
+# Description
+"AI.py" file is offline learning of model, and "bot.py" file is online fine-tuning and Discord API
