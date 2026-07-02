@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import re
 import threading
 from pathlib import Path
 
@@ -20,7 +21,6 @@ CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
 
 CHECK_INTERVAL_MINUTES = float(os.getenv("CHECK_INTERVAL_MINUTES", "60"))
 SEND_CHANCE = float(os.getenv("SEND_CHANCE", "0.35"))
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "50"))
 
 LEARN_FROM_CHAT = os.getenv("LEARN_FROM_CHAT", "1") != "0"
 LEARN_USER_IDS = {
@@ -45,11 +45,21 @@ ONLINE_BATCH_SIZE = int(os.getenv("ONLINE_BATCH_SIZE", "8"))
 ONLINE_EPOCHS = int(os.getenv("ONLINE_EPOCHS", "1"))
 ONLINE_LEARNING_RATE = float(os.getenv("ONLINE_LEARNING_RATE", "1e-6"))
 TRAIN_MAX_LENGTH = int(os.getenv("TRAIN_MAX_LENGTH", "128"))
+
 TOP_K = int(os.getenv("TOP_K", "50"))
 NO_REPEAT_NGRAM_SIZE = int(os.getenv("NO_REPEAT_NGRAM_SIZE", "3"))
 MIN_NEW_TOKENS = int(os.getenv("MIN_NEW_TOKENS", "8"))
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "60"))
 REPETITION_PENALTY = float(os.getenv("REPETITION_PENALTY", "1.15"))
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "60"))  # 40–70
+GENERATION_ATTEMPTS = int(os.getenv("GENERATION_ATTEMPTS", "5"))
+PROMPTS = [
+    prompt.strip() + " "
+    for prompt in os.getenv(
+        "GENERATION_PROMPTS",
+        "ну,|короче,|если честно,|вообще,|ладно,|я думаю,",
+    ).split("|")
+    if prompt.strip()
+]
 
 LEARN_LOG_FILE = Path(os.getenv("LEARN_LOG_FILE", "online_dataset.txt"))
 if not LEARN_LOG_FILE.is_absolute():
@@ -68,16 +78,30 @@ if not MODEL_DIR.exists():
 if LEARN_FROM_CHAT and not LEARN_USER_IDS:
     raise RuntimeError("Set LEARN_USER_IDS to your Discord user ID before enabling chat learning.")
 
+if not 0 <= SEND_CHANCE <= 1:
+    raise RuntimeError("SEND_CHANCE must be between 0 and 1.")
+
+if MIN_NEW_TOKENS > MAX_NEW_TOKENS:
+    raise RuntimeError("MIN_NEW_TOKENS must be less than or equal to MAX_NEW_TOKENS.")
+
+if not PROMPTS:
+    raise RuntimeError("GENERATION_PROMPTS must contain at least one prompt.")
+
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-tokenizer = tr.PreTrainedTokenizerFast.from_pretrained(MODEL_DIR)
-model = tr.GPT2LMHeadModel.from_pretrained(MODEL_DIR).to(device)
+tokenizer = tr.AutoTokenizer.from_pretrained(MODEL_DIR)
+model = tr.AutoModelForCausalLM.from_pretrained(MODEL_DIR).to(device)
 
 if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
     tokenizer.pad_token = tokenizer.eos_token
 
+if tokenizer.pad_token_id is None:
+    raise RuntimeError("Tokenizer has no PAD token and no EOS token to use as PAD.")
+
 model.config.pad_token_id = tokenizer.pad_token_id
+model.config.eos_token_id = tokenizer.eos_token_id
+model.config.bos_token_id = tokenizer.bos_token_id
 model.eval()
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=ONLINE_LEARNING_RATE)
@@ -90,38 +114,54 @@ intents.message_content = LEARN_FROM_CHAT
 client = discord.Client(intents=intents)
 
 
-def start_token_id() -> int:
-    for token_id in (
-        tokenizer.bos_token_id,
-        tokenizer.eos_token_id,
-        tokenizer.pad_token_id,
-    ):
-        if token_id is not None:
-            return token_id
+def is_good_generated_phrase(text: str) -> bool:
+    if not 5 <= len(text) <= 300:
+        return False
 
-    raise RuntimeError("Tokenizer has no BOS, EOS, or PAD token.")
+    if re.search(r"(https?://|www\.|/blockquote|<[^>]+>|[{}\[\]\\])", text, re.IGNORECASE):
+        return False
+
+    if re.search(r"\b(file|modifier|blockquote|code|number|required|order)\b", text, re.IGNORECASE):
+        return False
+
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", text)
+    cyrillic = re.findall(r"[А-Яа-яЁё]", text)
+
+    if not letters:
+        return False
+
+    return len(cyrillic) / len(letters) >= 0.6
 
 
 def generate_phrase() -> str:
-    input_ids = torch.tensor([[start_token_id()]], device=device)
+    for _ in range(GENERATION_ATTEMPTS):
+        prompt = random.choice(PROMPTS)
+        encoded = tokenizer(prompt, return_tensors="pt")
+        encoded = {key: value.to(device) for key, value in encoded.items()}
 
-    with model_lock:
-        with torch.no_grad():
-            output = model.generate(
-                input_ids=input_ids,
-                min_new_tokens=MIN_NEW_TOKENS, 
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=True,
-                temperature=0.9,
-                top_p=0.92,
-                top_k=TOP_K,  
-                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-                repetition_penalty=REPETITION_PENALTY,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
+        with model_lock:
+            with torch.no_grad():
+                output = model.generate(
+                    **encoded,
+                    min_new_tokens=MIN_NEW_TOKENS,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=True,
+                    temperature=0.85,
+                    top_p=0.9,
+                    top_k=TOP_K,
+                    no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+                    repetition_penalty=REPETITION_PENALTY,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
 
-    return tokenizer.decode(output[0], skip_special_tokens=True).strip()
+        text = tokenizer.decode(output[0], skip_special_tokens=True).strip()
+        text = text.splitlines()[0].strip()
+
+        if is_good_generated_phrase(text):
+            return text
+
+    return ""
 
 
 def clean_message(text: str) -> str | None:
